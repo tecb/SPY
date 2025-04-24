@@ -20,110 +20,123 @@ ALL_MODULES = [
     "5. Distribución de movimiento",
     "6. Comportamientos extremos",
     "7. Insights & señales",
-    "8. Histograma de retornos diarios",
+    "8. Histograma retornos diarios",
     "9. Cambios de signo intradía"
 ]
-
-# Load saved module selection
 if os.path.exists(CONFIG_FILE):
     try:
-        selected_modules = json.load(open(CONFIG_FILE))
-    except Exception:
-        selected_modules = ALL_MODULES.copy()
+        saved_modules = json.load(open(CONFIG_FILE))
+    except:
+        saved_modules = ALL_MODULES.copy()
 else:
-    selected_modules = ALL_MODULES.copy()
+    saved_modules = ALL_MODULES.copy()
 
 # -----------------------------------
-# UTILITIES
+# DATA FETCH UTILITY
 # -----------------------------------
 def fetch_spy_data(interval: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
     ticker = yf.Ticker('SPY')
-    if interval == '1d':
+    df = ticker.history(
+        interval=interval,
+        start=start_date.strftime('%Y-%m-%d'),
+        end=(end_date + timedelta(days=1)).strftime('%Y-%m-%d'),
+        prepost=False,
+        auto_adjust=False
+    )
+    if df.empty and interval != '1d':
+        limits = {'1m':7,'5m':59,'15m':59,'30m':59,'1h':730}
+        fallback = limits.get(interval,59)
+        st.warning(f"Intervalo {interval} sin datos; usando últimos {fallback} días.")
         df = ticker.history(
+            period=f"{fallback}d",
             interval=interval,
-            start=start_date.strftime('%Y-%m-%d'),
-            end=(end_date + timedelta(days=1)).strftime('%Y-%m-%d'),
             prepost=False,
             auto_adjust=False
         )
-    else:
-        df = ticker.history(
-            interval=interval,
-            start=start_date.strftime('%Y-%m-%d'),
-            end=(end_date + timedelta(days=1)).strftime('%Y-%m-%d'),
-            prepost=False,
-            auto_adjust=False
-        )
-        if df.empty:
-            defaults = {'1m':7,'5m':59,'15m':59,'30m':59,'1h':730}
-            fallback = defaults.get(interval,59)
-            st.warning(f"Intervalo '{interval}' no tiene datos para el rango; mostrando últimos {fallback} días.")
-            df = ticker.history(
-                period=f"{fallback}d",
-                interval=interval,
-                prepost=False,
-                auto_adjust=False
-            )
     df.index = pd.to_datetime(df.index)
     if df.index.tz is None:
         df.index = df.index.tz_localize('UTC')
     return df.tz_convert('America/New_York')
 
 # -----------------------------------
-# MODULE DEFINITIONS
+# CSV LOADER UTILITY
 # -----------------------------------
+def load_csv_df(uploaded_file) -> pd.DataFrame:
+    """
+    Lee CSV de 15m con encabezado o sin él y normaliza nombres de columnas.
+    """
+    # Intento con encabezado existente
+    try:
+        df = pd.read_csv(
+            uploaded_file,
+            sep=';',
+            header=0,
+            index_col=0,
+            parse_dates=True
+        )
+    except Exception:
+        # Fallback: asignar nombres
+        df = pd.read_csv(
+            uploaded_file,
+            sep=';',
+            header=None,
+            names=['Datetime','Open','High','Low','Close','Volume'],
+            index_col=0,
+            parse_dates=['Datetime']
+        )
+    # Normalizar nombres de columnas a capitalized
+    df.columns = df.columns.str.strip().str.title()
+    # Asegurar índice de tiempo con TZ correcto
+    df.index = pd.to_datetime(df.index, utc=True).tz_convert('America/New_York')
+    return df
+
+# -----------------------------------
+# MODULE IMPLEMENTATIONS
+# -----------------------------------
+
 def module_daily_anatomy(df: pd.DataFrame):
-    st.subheader("1. Anatomía diaria")
-    df2 = df.copy()
-    df2['Range'] = df2['High'] - df2['Low']
-    df2['Body'] = (df2['Close'] - df2['Open']).abs()
-    df2['Upper_Wick'] = df2['High'] - df2[['Open','Close']].max(axis=1)
-    df2['Lower_Wick'] = df2[['Open','Close']].min(axis=1) - df2['Low']
+    st.subheader("1. Anatomía de la vela diaria")
+    d = df.copy()
+    d['Range'] = d['High'] - d['Low']
+    d['Body']  = (d['Close'] - d['Open']).abs()
+    d['Upper_Wick'] = d['High'] - d[['Open','Close']].max(axis=1)
+    d['Lower_Wick'] = d[['Open','Close']].min(axis=1) - d['Low']
     stats = pd.DataFrame({
-        'Mean': [df2[c].mean() for c in ['Range','Body','Upper_Wick','Lower_Wick']],
-        'Median': [df2[c].median() for c in ['Range','Body','Upper_Wick','Lower_Wick']],
-        'Std': [df2[c].std() for c in ['Range','Body','Upper_Wick','Lower_Wick']]
+        'Mean':   [d[c].mean() for c in ['Range','Body','Upper_Wick','Lower_Wick']],
+        'Median': [d[c].median() for c in ['Range','Body','Upper_Wick','Lower_Wick']],
+        'Std':    [d[c].std() for c in ['Range','Body','Upper_Wick','Lower_Wick']]
     }, index=['Range','Body','Upper_Wick','Lower_Wick'])
     st.table(stats)
-    st.write(f"% Alcista: {100*(df2['Close']>df2['Open']).mean():.2f}%")
-    st.write(f"% Bajista: {100*(df2['Close']<df2['Open']).mean():.2f}%")
-    st.write(f"% Alcistas w/ lower wick>cuerpo: {100*((df2['Close']>df2['Open'])&(df2['Lower_Wick']>df2['Body'])).mean():.2f}%")
-    st.write(f"% Bajistas w/ upper wick>cuerpo: {100*((df2['Close']<df2['Open'])&(df2['Upper_Wick']>df2['Body'])).mean():.2f}%")
-    df2['Prev_Close'] = df2['Close'].shift(1)
-    df2['Gap'] = df2['Open'] - df2['Prev_Close']
-    gaps = df2.dropna(subset=['Gap'])
-    st.write(f"Gaps totales: {len(gaps)}, Alcista: {len(gaps[gaps['Gap']>0])}, Bajista: {len(gaps[gaps['Gap']<0])}")
-    gaps['Filled'] = ((gaps['Gap']<0)&(gaps['Low']<=gaps['Prev_Close'])) | ((gaps['Gap']>0)&(gaps['High']>=gaps['Prev_Close']))
-    st.write(f"% Gaps llenados: {100*gaps['Filled'].mean():.2f}%")
+    st.write(f"% Alcista: {100*(d['Close']>d['Open']).mean():.2f}%")
+    st.write(f"% Bajista: {100*(d['Close']<d['Open']).mean():.2f}%")
 
 
 def module_intraday_reversion(intra: pd.DataFrame, daily: pd.DataFrame):
-    st.subheader("2. Reversiones intradía")
+    st.subheader("2. Estadísticas de reversión intradía")
     if intra.empty:
         st.info("No hay datos intradía.")
         return
     df2 = intra.reset_index().rename(columns={intra.index.name or 'index':'Datetime'})
-    df2['Day']=df2['Datetime'].dt.date
-    res=[]
-    for day,grp in df2.groupby('Day'):
-        prev = daily['Close'].shift(1).get(pd.Timestamp(day),np.nan)
-        if pd.isna(prev): continue
-        open_,close_=grp['Open'].iloc[0],grp['Close'].iloc[-1]
-        d={'Day':day,'Gap%':100*(open_/prev-1),'Reverted':(open_<prev and close_>open_) or (open_>prev and close_<open_)}
-        if close_>open_:
-            d['Min%']=100*(grp['Low'].min()/open_-1)
-            d['TimeMin']=grp.loc[grp['Low'].idxmin(),'Datetime'].time()
+    df2['Day'] = df2['Datetime'].dt.date
+    results=[]
+    for day, grp in df2.groupby('Day'):
+        prev_close = daily['Close'].shift(1).get(pd.Timestamp(day), np.nan)
+        if pd.isna(prev_close): continue
+        o, c = grp['Open'].iloc[0], grp['Close'].iloc[-1]
+        rev = (o<prev_close and c>o) or (o>prev_close and c<o)
+        d = {'Day':day, 'Reverted':rev, 'Gap%':100*(o/prev_close-1)}
+        if c>o:
+            d['Min%']=100*(grp['Low'].min()/o-1)
+            d['T_Min']=grp.loc[grp['Low'].idxmin(),'Datetime'].time()
         else:
-            d['Max%']=100*(grp['High'].max()/open_-1)
-            d['TimeMax']=grp.loc[grp['High'].idxmax(),'Datetime'].time()
-        res.append(d)
-    rez=pd.DataFrame(res)
-    if rez.empty:
-        st.write("Sin reversiones.")
+            d['Max%']=100*(grp['High'].max()/o-1)
+            d['T_Max']=grp.loc[grp['High'].idxmax(),'Datetime'].time()
+        results.append(d)
+    res = pd.DataFrame(results)
+    if res.empty:
+        st.write("No se detectaron reversiones.")
         return
-    st.write(f"Prob. reversión: {100*rez['Reverted'].mean():.2f}%")
-    if 'TimeMin' in rez:
-        st.altair_chart(alt.Chart(rez).mark_bar().encode(x='TimeMin:T',y='Reverted:Q'),use_container_width=True)
+    st.write(f"Prob. reversión: {100*res['Reverted'].mean():.2f}%")
 
 
 def module_chrono(intra: pd.DataFrame):
@@ -131,95 +144,175 @@ def module_chrono(intra: pd.DataFrame):
     if intra.empty:
         st.info("No hay datos intradía.")
         return
-    df3=intra.reset_index().rename(columns={intra.index.name or 'index':'Datetime'})
-    df3['Block']=df3['Datetime'].dt.strftime('%H:%M')
-    df3['Return%']=100*(df3['Close']/df3['Open']-1)
-    summary=df3.groupby('Block')['Return%'].agg(['mean','std','count'])
-    summary['Up%']=df3.groupby('Block').apply(lambda x:(x['Close']>x['Open']).mean()*100)
+    df3 = intra.reset_index().rename(columns={intra.index.name or 'index':'Datetime'})
+    df3['Block'] = df3['Datetime'].dt.strftime('%H:%M')
+    df3['Ret%']  = 100*(df3['Close']/df3['Open']-1)
+    summary = df3.groupby('Block')['Ret%'].agg(['mean','std','count'])
+    summary['Up%'] = df3.groupby('Block').apply(lambda g:(g['Close']>g['Open']).mean()*100)
     st.line_chart(summary[['mean','Up%']])
-    seq=(df3['Close']>df3['Open']).astype(int)
-    trans=pd.crosstab(seq.shift(),seq,normalize='index')*100
-    st.write("Transición (%):")
+    seq = (df3['Close']>df3['Open']).astype(int)
+    trans = pd.crosstab(seq.shift(), seq, normalize='index')*100
+    st.write("Matriz transiciones (%):")
     st.table(trans)
 
-
 def module_close_prob(daily: pd.DataFrame):
-    st.subheader("4. Probabilidades de cierre")
-    df=daily.copy()
-    df['PrevClose']=df['Close'].shift(1)
-    df['PrevHigh']=df['High'].shift(1)
-    df['PrevLow']=df['Low'].shift(1)
-    off=st.sidebar.slider("Offset%",0.0,5.0,0.5,0.1)
-    df['OffPrice']=df['PrevClose']*(1+off/100)
-    st.write(f">Open: {100*(df['Close']>df['Open']).mean():.2f}%")
-    st.write(f">PrevClose: {100*(df['Close']>df['PrevClose']).mean():.2f}%")
-    st.write(f">PrevHigh: {100*(df['Close']>df['PrevHigh']).mean():.2f}%")
-    st.write(f"<PrevLow: {100*(df['Close']<df['PrevLow']).mean():.2f}%")
-    st.write(f">Offset {off}%: {100*(df['Close']>df['OffPrice']).mean():.2f}%")
+    st.subheader("4. Probabilidades de cierre relativo")
+    d = daily.copy()
+    d['Prev_Close'] = d['Close'].shift(1)
+    d['Prev_High']  = d['High'].shift(1)
+    d['Prev_Low']   = d['Low'].shift(1)
+
+    # Slider de offset ahora de -5% a +5%
+    off = st.sidebar.slider(
+        "Offset % (puede ser negativo)",
+        min_value=-5.0,
+        max_value=5.0,
+        value=0.0,
+        step=0.1
+    )
+
+    # Precio objetivo con offset
+    d['OffPrice'] = d['Prev_Close'] * (1 + off/100)
+
+    # Métricas base
+    st.write(f"% cierre > open:          {100*(d['Close']>d['Open']).mean():.2f}%")
+    st.write(f"% cierre > prev close:    {100*(d['Close']>d['Prev_Close']).mean():.2f}%")
+    st.write(f"% cierre > prev high:     {100*(d['Close']>d['Prev_High']).mean():.2f}%")
+    st.write(f"% cierre < prev low:      {100*(d['Close']<d['Prev_Low']).mean():.2f}%")
+
+    # Offset positive or negative
+    st.write(f"% cierre > offset ({off:+.1f}%): {100*(d['Close']>d['OffPrice']).mean():.2f}%")
+    st.write(f"% cierre < offset ({off:+.1f}%): {100*(d['Close']<d['OffPrice']).mean():.2f}%")
+
 
 
 def module_distribution(daily: pd.DataFrame):
     st.subheader("5. Distribución de movimiento")
-    df=daily.copy()
-    df['Range%']=100*(df['High']-df['Low'])/df['Open']
-    st.altair_chart(alt.Chart(df).mark_bar().encode(alt.X('Range%',bin=alt.Bin(maxbins=50)),y='count()'),use_container_width=True)
+    # Cálculo del rango porcentual
+    df = daily.copy()
+    df['Range%'] = 100 * (df['High'] - df['Low']) / df['Open']
+    r = df['Range%']
 
+    # Determinar el máximo absoluto para el dominio (-max, +max)
+    max_r = r.max()
+    domain_max = round(max_r + 0.1, 1)
+    domain = [0, domain_max]
+
+    # Histograma con bins de 0.1% y dominio simétrico, interactivo para zoom
+    chart = (
+        alt.Chart(df)
+           .mark_bar()
+           .encode(
+               alt.X('Range%:Q',
+                     bin=alt.Bin(step=0.1, extent=domain),
+                     title='Rango % (bins de 0.1%)'),
+               y=alt.Y('count()', title='Frecuencia')
+           )
+           .properties(
+               title='Distribución de amplitud intradía'
+           )
+           .interactive()   # <— Habilita zoom rectangular y paneo
+    )
+    st.altair_chart(chart, use_container_width=True)
+	
 
 def module_extremes(daily: pd.DataFrame):
     st.subheader("6. Comportamientos extremos")
-    df=daily.copy()
-    df['Gap%']=100*(df['Open']/df['Close'].shift(1)-1)
-    st.table(df['Gap%'].abs().nlargest(5))
-    df['Candle%']=100*(df['Close']/df['Open']-1)
-    st.table(df['Candle%'].abs().nlargest(5))
+    d = daily.copy()
+    d['Gap%']=100*(d['Open']/d['Close'].shift(1)-1)
+    st.write("Top 5 gaps %:")
+    st.table(d['Gap%'].abs().nlargest(5))
+    d['Size%']=100*(d['Close']/d['Open']-1)
+    st.write("Top 5 velas %:")
+    st.table(d['Size%'].abs().nlargest(5))
 
 
 def module_insights(daily: pd.DataFrame):
     st.subheader("7. Insights & señales")
-    df=daily.copy()
-    df['Body']=abs(df['Close']-df['Open'])
-    df['LowerW']=df[['Open','Close']].min(axis=1)-df['Low']
-    pat=df[(df['LowerW']>2*df['Body'])&(df['Close']>df['Open'])]
-    st.write(f"Velas mecha inf>2x cuerpo: {len(pat)}")
-    if not pat.empty:
-        st.write(f"Prob. alcista post patrón: {100*(pat['Close']>pat['Open']).mean():.2f}%")
+    d = daily.copy()
+    d['Body']=abs(d['Close']-d['Open'])
+    d['Low_Wick']=d[['Open','Close']].min(axis=1)-d['Low']
+    pat = d[(d['Low_Wick']>2*d['Body'])&(d['Close']>d['Open'])]
+    st.write(f"Patrones: {len(pat)} días")
 
 
 def module_returns_histogram(daily: pd.DataFrame):
     st.subheader("8. Histograma retornos diarios")
-    ret=100*(daily['Close']/daily['Open']-1)
-    df=ret.to_frame('Ret%').reset_index()
-    st.altair_chart(alt.Chart(df).mark_bar().encode(alt.X('Ret%:Q',bin=alt.Bin(maxbins=50)),y='count()'),use_container_width=True)
+    # Calcular retorno diario %
+    df = daily.copy()
+    df['Ret%'] = 100 * (df['Close'] / df['Open'] - 1)
+    series = df['Ret%']
+
+    # Dominio simétrico basado en el valor absoluto máximo
+    max_r = series.abs().max()
+    domain_max = round(max_r + 0.1, 1)
+    extent = [-domain_max, domain_max]
+
+    # Histograma con bins de 0.1% y zoom interactivo
+    chart = (
+        alt.Chart(df)
+           .mark_bar()
+           .encode(
+               alt.X('Ret%:Q',
+                     bin=alt.Bin(step=0.1, extent=extent),
+                     title='Retorno diario (%)'),
+               alt.Y('count()', title='Frecuencia')
+           )
+           .properties(title='Histograma retornos diarios')
+           .interactive()   # habilita zoom rectangular y paneo
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
-def module_sign_changes(sign_df: pd.DataFrame, daily: pd.DataFrame):
-    st.subheader("9. Cambios de signo intradía")
-    if sign_df.empty:
+
+def module_sign_changes(intra: pd.DataFrame):
+    st.subheader("9. Cambios de signo intradía & dispersión")
+    if intra.empty:
         st.info("No hay datos intradía.")
         return
-    prev_map={dt.date():price for dt,price in zip(daily.index,daily['Close'].shift(1))}
-    df=sign_df.copy()
-    df['Date']=df.index.date
-    res=[]
-    for day,grp in df.groupby('Date'):
-        prev=prev_map.get(day,np.nan)
-        if pd.isna(prev): continue
-        signs=(grp['Close']>prev).astype(int)
-        ch=int(signs.diff().abs().sum())
-        res.append({'Day':day,'SignChanges':ch})
-    r=pd.DataFrame(res)
-    if r.empty:
-        st.write("No cambios.")
-    else:
-        st.table(r.set_index('Day'))
-        st.write(f"Promedio: {r['SignChanges'].mean():.2f}")
-        hist = (
-        alt.Chart(r)
-        .transform_aggregate(count='count()', groupby=['SignChanges'])
+    # Cálculo de cierre diario a partir de intradía
+    daily_close_series = intra['Close'].resample('D').last().dropna()
+    # Mapear por fecha (date) sin zona horaria
+    daily_close_by_date = {ts.date(): price for ts, price in daily_close_series.items()}
+
+    # Preparar DataFrame base
+    df2 = intra.reset_index().rename(columns={intra.index.name or 'index':'Datetime'})
+    df2['Day'] = df2['Datetime'].dt.date
+    records = []
+    for day, grp in df2.groupby('Day'):
+        prev_date = day - timedelta(days=1)
+        pc = daily_close_by_date.get(prev_date, np.nan)
+        if pd.isna(pc):
+            continue
+        # Serie de signos: 1 si Close > pc, 0 en caso contrario
+        sig = (grp['Close'] > pc).astype(int)
+        # Detectar cambios de signo (0->1 o 1->0)
+        change_points = sig.diff().abs() == 1
+        idxs = np.where(change_points)[0]
+        cnt = len(idxs)
+        if cnt == 0:
+            continue
+        if cnt > 1:
+            diffs = np.diff(idxs)
+            min_i = int(diffs.min())
+            max_i = int(idxs[-1] - idxs[0])
+        else:
+            min_i = max_i = 0
+        records.append({'Day': day, 'SignChanges': cnt, 'MinInterval': min_i, 'MaxInterval': max_i})
+    if not records:
+        st.write("Sin cambios de signo detectados.")
+        return
+    df_rec = pd.DataFrame(records).set_index('Day')
+    st.dataframe(df_rec)
+    st.write(f"Promedio cambios: {df_rec['SignChanges'].mean():.2f}")
+    st.write(f"Intervalo mínimo promedio: {df_rec['MinInterval'].mean():.2f} velas")
+    st.write(f"Intervalo máximo promedio: {df_rec['MaxInterval'].mean():.2f} velas")
+    hist = (
+        alt.Chart(df_rec.reset_index())
         .mark_bar()
         .encode(
-            x=alt.X('SignChanges:Q', title='Número de cambios de signo'),
-            y=alt.Y('count:Q', title='Frecuencia')
+            x=alt.X('SignChanges:Q', bin=alt.Bin(step=1), title='Nº cambios'),
+            y=alt.Y('count():Q', title='Frecuencia')
         )
         .properties(title='Histograma de cambios de signo intradía')
     )
@@ -228,46 +321,73 @@ def module_sign_changes(sign_df: pd.DataFrame, daily: pd.DataFrame):
 # -----------------------------------
 # MAIN APP
 # -----------------------------------
-st.title("Análisis Estadístico SPY Avanzado")
-# Sidebar inputs
-st.sidebar.header("Configuración")
-start=st.sidebar.date_input("Fecha inicio",datetime(2010,1,1))
-end=st.sidebar.date_input("Fecha fin",datetime.now().date())
-interval=st.sidebar.selectbox("Intervalo principal",['1d','1h','30m','15m','5m','1m'])
-sign_interval=st.sidebar.selectbox("Intervalo signo",['5m','15m','30m','1h'])
+st.title("Análisis SPY Avanzado")
 
-# Module selection form
-with st.sidebar.form(key='config'):
-    sel=st.multiselect("Selecciona módulos",ALL_MODULES,default=selected_modules)
-    btn=st.form_submit_button("Analizar")
-    if btn:
-        st.session_state.mods=sel
-        json.dump(sel,open(CONFIG_FILE,'w'))
-    elif 'mods' not in st.session_state:
-        st.session_state.mods=selected_modules
+# Sidebar: parámetros generales
+start = st.sidebar.date_input("Inicio", datetime(2010,1,1))
+end   = st.sidebar.date_input("Fin", datetime.now().date())
+base_interval = st.sidebar.selectbox("Intervalo Yahoo", ['1d','1h','30m','15m','5m','1m'], index=0)
+sign_interval = st.sidebar.selectbox("Intervalo señal", ['5m','15m','30m','1h'], index=0)
+use_csv = st.sidebar.checkbox("Usar CSV histórico (15m)")
+uploaded_file = None
+if use_csv:
+    uploaded_file = st.sidebar.file_uploader("Cargar CSV 15m", type='csv')
+    if uploaded_file:
+        st.sidebar.success("CSV cargado")
+        base_interval = '15m'
+modules = st.sidebar.multiselect("Módulos a ejecutar", ALL_MODULES, default=saved_modules)
+run = st.sidebar.button("Analizar")
 
-# Load data
-daily_df=fetch_spy_data('1d',datetime.combine(start,datetime.min.time()),datetime.combine(end,datetime.min.time()))
-intra_df=fetch_spy_data(interval,datetime.combine(start,datetime.min.time()),datetime.combine(end,datetime.min.time()))
-sign_df=fetch_spy_data(sign_interval,datetime.combine(start,datetime.min.time()),datetime.combine(end,datetime.min.time()))
+if 'run' not in st.session_state:
+    st.session_state.run = False
+if run:
+    st.session_state.run = True
 
-# Raw data option
-if st.sidebar.checkbox("Mostrar datos brutos"):
-    st.subheader("Datos intradía brutos")
-    st.write(intra_df.head())
+if not st.session_state.run:
+    st.info("Configura y pulsa 'Analizar'.")
+    st.stop()
 
-# Execute selected modules
-for m in st.session_state.mods:
-    if m.startswith('1'): module_daily_anatomy(daily_df)
-    if m.startswith('2'): module_intraday_reversion(intra_df,daily_df)
-    if m.startswith('3'): module_chrono(intra_df)
-    if m.startswith('4'): module_close_prob(daily_df)
-    if m.startswith('5'): module_distribution(daily_df)
-    if m.startswith('6'): module_extremes(daily_df)
-    if m.startswith('7'): module_insights(daily_df)
-    if m.startswith('8'): module_returns_histogram(daily_df)
-    if m.startswith('9'): module_sign_changes(sign_df,daily_df)
+# Carga de datos diarios
+daily_df = fetch_spy_data(
+    '1d',
+    datetime.combine(start, datetime.min.time()),
+    datetime.combine(end, datetime.min.time())
+)
+# Carga de datos intradía
+if use_csv:
+    if not uploaded_file:
+        st.error("Debe subir un CSV.")
+        st.stop()
+    intra_df = load_csv_df(uploaded_file)
+else:
+    intra_df = fetch_spy_data(
+        base_interval,
+        datetime.combine(start, datetime.min.time()),
+        datetime.combine(end, datetime.min.time())
+    )
+# Ejecución de módulos
+for m in modules:
+    if m.startswith('1'):
+        module_daily_anatomy(daily_df)
+    if m.startswith('2'):
+        module_intraday_reversion(intra_df, daily_df)
+    if m.startswith('3'):
+        module_chrono(intra_df)
+    if m.startswith('4'):
+        module_close_prob(daily_df)
+    if m.startswith('5'):
+        module_distribution(daily_df)
+    if m.startswith('6'):
+        module_extremes(daily_df)
+    if m.startswith('7'):
+        module_insights(daily_df)
+    if m.startswith('8'):
+        module_returns_histogram(daily_df)
+    if m.startswith('9'):
+        module_sign_changes(intra_df)
 
-# CSV export
-df_export=intra_df if interval!='1d' else daily_df
-st.download_button("Exportar CSV",df_export.to_csv().encode('utf-8'),"spy_data.csv","text/csv")
+# Exportar CSV
+df_export = intra_df if base_interval != '1d' else daily_df
+st.download_button("Exportar CSV", df_export.to_csv().encode('utf-8'), f"spy_{base_interval}.csv", "text/csv")
+
+
