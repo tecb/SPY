@@ -268,11 +268,44 @@ def module_extremes(daily: pd.DataFrame):
 
 def module_insights(daily: pd.DataFrame):
     st.subheader("7. Insights & señales")
+    st.markdown(
+        "Este módulo detecta patrones de velas clásicos y evalúa su rendimiento al día siguiente."
+    )
+
+    # Preparamos el DataFrame
     d = daily.copy()
-    d['Body']=abs(d['Close']-d['Open'])
-    d['Low_Wick']=d[['Open','Close']].min(axis=1)-d['Low']
-    pat = d[(d['Low_Wick']>2*d['Body'])&(d['Close']>d['Open'])]
-    st.write(f"Patrones: {len(pat)} días")
+    d['Body']       = (d['Close'] - d['Open']).abs()
+    d['Lower_Wick'] = d[['Open','Close']].min(axis=1) - d['Low']
+    d['Upper_Wick'] = d['High'] - d[['Open','Close']].max(axis=1)
+    prev = d.shift(1)
+
+    # Definición de patrones
+    patterns = {
+        'Hammer':            (d['Lower_Wick'] > 2*d['Body']) & (d['Close'] > d['Open']),
+        'Shooting Star':     (d['Upper_Wick'] > 2*d['Body']) & (d['Close'] < d['Open']),
+        'Marubozu':          d['Body'] >= 0.9*(d['High'] - d['Low']),
+        'Doji':              d['Body'] <= 0.05*(d['High'] - d['Low']),
+        'Engulfing Alcista': (d['Close'] > d['Open']) & (d['Open'] < prev['Close']) & (d['Close'] > prev['Open']),
+        'Engulfing Bajista': (d['Close'] < d['Open']) & (d['Open'] > prev['Close']) & (d['Close'] < prev['Open']),
+    }
+
+    # Calculamos el retorno del día siguiente en %
+    next_return = (d['Close'].shift(-1) / d['Open'].shift(-1) - 1) * 100
+
+    # Preparamos filas para la tabla resumen
+    rows = []
+    for name, mask in patterns.items():
+        count = int(mask.sum())
+        avg_ret = next_return[mask].mean() if count > 0 else np.nan
+        rows.append((name, count, round(avg_ret,2)))
+        st.markdown(f"- **{name}**: {count} días — Next Day Avg Return: {avg_ret:.2f}%")
+
+    # Construimos y mostramos la tabla final
+    summary = pd.DataFrame(
+        rows,
+        columns=['Patrón','Frecuencia','Avg Retorno 1D (%)']
+    ).set_index('Patrón')
+    st.table(summary)
 
 
 def module_returns_histogram(daily: pd.DataFrame):
