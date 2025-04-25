@@ -314,7 +314,7 @@ def module_sign_changes(intra: pd.DataFrame):
 # -----------------------------------
 # MAIN APP
 # -----------------------------------
-st.title("Análisis SPY Avanzado")
+st.title("Análisis Cuantitativo")
 
 # Sidebar: ticker input (used if no CSV)
 ticker_input = st.sidebar.text_input("Ticker (Yahoo)", value="SPY").upper()
