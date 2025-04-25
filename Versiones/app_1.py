@@ -32,13 +32,10 @@ else:
     saved_modules = ALL_MODULES.copy()
 
 # -----------------------------------
-# UTILITIES
+# DATA FETCH UTILITY
 # -----------------------------------
-def get_symbol_from_filename(filename: str) -> str:
-    return os.path.splitext(os.path.basename(filename))[0].upper()
-
-def fetch_data(symbol: str, interval: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
-    ticker = yf.Ticker(symbol)
+def fetch_spy_data(interval: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    ticker = yf.Ticker('SPY')
     df = ticker.history(
         interval=interval,
         start=start_date.strftime('%Y-%m-%d'),
@@ -49,7 +46,7 @@ def fetch_data(symbol: str, interval: str, start_date: datetime, end_date: datet
     if df.empty and interval != '1d':
         limits = {'1m':7,'5m':59,'15m':59,'30m':59,'1h':730}
         fallback = limits.get(interval,59)
-        st.warning(f"Intervalo {interval} sin datos; usando últimos {fallback} días de Yahoo.")
+        st.warning(f"Intervalo {interval} sin datos; usando últimos {fallback} días.")
         df = ticker.history(
             period=f"{fallback}d",
             interval=interval,
@@ -61,7 +58,14 @@ def fetch_data(symbol: str, interval: str, start_date: datetime, end_date: datet
         df.index = df.index.tz_localize('UTC')
     return df.tz_convert('America/New_York')
 
+# -----------------------------------
+# CSV LOADER UTILITY
+# -----------------------------------
 def load_csv_df(uploaded_file) -> pd.DataFrame:
+    """
+    Lee CSV de 15m con encabezado o sin él y normaliza nombres de columnas.
+    """
+    # Intento con encabezado existente
     try:
         df = pd.read_csv(
             uploaded_file,
@@ -71,6 +75,7 @@ def load_csv_df(uploaded_file) -> pd.DataFrame:
             parse_dates=True
         )
     except Exception:
+        # Fallback: asignar nombres
         df = pd.read_csv(
             uploaded_file,
             sep=';',
@@ -79,7 +84,9 @@ def load_csv_df(uploaded_file) -> pd.DataFrame:
             index_col=0,
             parse_dates=['Datetime']
         )
+    # Normalizar nombres de columnas a capitalized
     df.columns = df.columns.str.strip().str.title()
+    # Asegurar índice de tiempo con TZ correcto
     df.index = pd.to_datetime(df.index, utc=True).tz_convert('America/New_York')
     return df
 
@@ -316,152 +323,49 @@ def module_sign_changes(intra: pd.DataFrame):
 # -----------------------------------
 st.title("Análisis SPY Avanzado")
 
-# Sidebar: ticker input (used if no CSV)
-ticker_input = st.sidebar.text_input("Ticker (Yahoo)", value="SPY").upper()
-
-# Sidebar: CSV upload options
-use_csv_intra = st.sidebar.checkbox("Usar CSV intradía (15m)")
-uploaded_intra = None
-if use_csv_intra:
-    # Listar archivos *_15m.csv en carpeta historicos
-    import re
-    intra_files = [f for f in os.listdir('historicos') if re.match(r'.+_15m\.csv$', f, re.IGNORECASE)]
-    if intra_files:
-        selected_intra = st.sidebar.selectbox("Selecciona CSV intradía", intra_files)
-        uploaded_intra = os.path.join('historicos', selected_intra)
-    else:
-        st.sidebar.warning("No se encontraron CSV intradía en carpeta 'historicos'.")
-
-use_csv_daily = st.sidebar.checkbox("Usar CSV diario (1d)")
-uploaded_daily = None
-if use_csv_daily:
-    # Listar archivos *_1d.csv o *_daily.csv en carpeta historicos
-    import re
-    daily_files = [f for f in os.listdir('historicos') if re.match(r'.+_(1d|daily)\.csv$', f, re.IGNORECASE)]
-    if daily_files:
-        selected_daily = st.sidebar.selectbox("Selecciona CSV diario", daily_files)
-        uploaded_daily = os.path.join('historicos', selected_daily)
-    else:
-        st.sidebar.warning("No se encontraron CSV diarios en carpeta 'historicos'.")
-
-# Sidebar: Yahoo interval selector for intradía when not using CSV intradía for intradía when not using CSV intradía
-yahoo_interval = st.sidebar.selectbox(
-    "Intervalo intradía Yahoo", ['1h','30m','15m','5m','1m'], index=2
-)
-
-# Sidebar: module selection
-modules = st.sidebar.multiselect(
-    "Selecciona módulos a ejecutar",
-    ALL_MODULES,
-    default=saved_modules
-)
-
-# Sidebar: run button
+# Sidebar: parámetros generales
+start = st.sidebar.date_input("Inicio", datetime(2010,1,1))
+end   = st.sidebar.date_input("Fin", datetime.now().date())
+base_interval = st.sidebar.selectbox("Intervalo Yahoo", ['1d','1h','30m','15m','5m','1m'], index=0)
+sign_interval = st.sidebar.selectbox("Intervalo señal", ['5m','15m','30m','1h'], index=0)
+use_csv = st.sidebar.checkbox("Usar CSV histórico (15m)")
+uploaded_file = None
+if use_csv:
+    uploaded_file = st.sidebar.file_uploader("Cargar CSV 15m", type='csv')
+    if uploaded_file:
+        st.sidebar.success("CSV cargado")
+        base_interval = '15m'
+modules = st.sidebar.multiselect("Módulos a ejecutar", ALL_MODULES, default=saved_modules)
 run = st.sidebar.button("Analizar")
+
 if 'run' not in st.session_state:
     st.session_state.run = False
 if run:
     st.session_state.run = True
 
-# Block until Analyze
 if not st.session_state.run:
     st.info("Configura y pulsa 'Analizar'.")
     st.stop()
 
-# Helper to parse CSV filename: SYMBOL_INTERVAL.csv
-import re
-
-def parse_csv_filename(name: str):
-    basename = os.path.splitext(os.path.basename(name))[0]
-    parts = re.split(r'[_\-]', basename)
-    if len(parts) >= 2:
-        sym = parts[0].upper()
-        intr = parts[-1].lower()
-        return sym, intr
-    return None, None
-
-# Determine symbol and data source consistency
-# Intradía CSV
-symbol_intra = ticker_input
-if use_csv_intra:
-    if not uploaded_intra:
-        st.error("Debe cargar el CSV intradía.")
+# Carga de datos diarios
+daily_df = fetch_spy_data(
+    '1d',
+    datetime.combine(start, datetime.min.time()),
+    datetime.combine(end, datetime.min.time())
+)
+# Carga de datos intradía
+if use_csv:
+    if not uploaded_file:
+        st.error("Debe subir un CSV.")
         st.stop()
-    sym_i, int_i = parse_csv_filename(uploaded_intra)  # corregido: usar archivo intradía
-    if int_i != '15m':
-        st.error(f"Intervalo inválido en nombre CSV intradía: {int_i}. Debe ser '15m'.")
-        st.stop()
-    symbol_intra = sym_i
-# Diario CSV
-symbol_daily = ticker_input
-if use_csv_daily:
-    if not uploaded_daily:
-        st.error("Debe cargar el CSV diario.")
-        st.stop()
-    sym_d, int_d = parse_csv_filename(uploaded_daily)  # corregido: parsear ruta de CSV diario directamente
-    if int_d not in ('1d','daily'):
-        st.error(f"Intervalo inválido en nombre CSV diario: {int_d}. Debe ser '1d'.")
-        st.stop()
-    symbol_daily = sym_d
-# Ensure same symbol
-global_symbol = symbol_intra
-if use_csv_daily:
-    if symbol_daily != symbol_intra:
-        st.error(f"Mismatch de símbolo entre intradía ({symbol_intra}) y diario ({symbol_daily}).")
-        st.stop()
-elif not use_csv_intra:
-    global_symbol = ticker_input
-
-# Validate consistency with ticker_input
-if use_csv_intra and not use_csv_daily and ticker_input != symbol_intra:
-    st.error(f"El ticker seleccionado ({ticker_input}) no coincide con el activo del CSV intradía ({symbol_intra}).")
-    st.stop()
-if use_csv_daily and not use_csv_intra and ticker_input != symbol_daily:
-    st.error(f"El ticker seleccionado ({ticker_input}) no coincide con el activo del CSV diario ({symbol_daily}).")
-    st.stop()
-# Display asset
-st.subheader(f"Activo: {global_symbol}")
-
-# Date range inputs
-start = st.sidebar.date_input("Fecha inicio", datetime(2010,1,1))
-end   = st.sidebar.date_input("Fecha fin", datetime.now().date())
-
-# Load daily data
-daily_df = None
-if use_csv_daily:
-    # CSV diario con fecha dd/mm/yyyy
-    df_temp = pd.read_csv(
-        uploaded_daily,
-        sep=';',
-        parse_dates=[0],
-        dayfirst=True,
-        index_col=0
-    )
-    df_temp.columns = df_temp.columns.str.strip().str.title()
-    df_temp.index = pd.to_datetime(df_temp.index, dayfirst=True, utc=True).tz_convert('America/New_York')
-    daily_df = df_temp
+    intra_df = load_csv_df(uploaded_file)
 else:
-    daily_df = fetch_data(
-        global_symbol,
-        '1d',
+    intra_df = fetch_spy_data(
+        base_interval,
         datetime.combine(start, datetime.min.time()),
         datetime.combine(end, datetime.min.time())
     )
-
-# Load intraday data
-intra_df = None
-if use_csv_intra:
-    intra_df = load_csv_df(uploaded_intra)
-else:
-    intra_df = fetch_data(global_symbol, yahoo_interval, datetime.combine(start, datetime.min.time()), datetime.combine(end, datetime.min.time()))
-
-# Optional raw display
-if st.sidebar.checkbox("Mostrar datos brutos intradía"):
-    st.subheader("Datos intradía brutos")
-    st.write(intra_df.head())
-
-# Execute selected modules
-df_export = None
+# Ejecución de módulos
 for m in modules:
     if m.startswith('1'):
         module_daily_anatomy(daily_df)
@@ -481,13 +385,9 @@ for m in modules:
         module_returns_histogram(daily_df)
     if m.startswith('9'):
         module_sign_changes(intra_df)
-    df_export = intra_df if m.startswith(('2','3','9','5','8')) else daily_df
 
-# Export CSV of last dataset used
-if df_export is not None:
-    st.download_button(
-        "Exportar CSV",
-        df_export.to_csv().encode('utf-8'),
-        f"{global_symbol}_data.csv",
-        "text/csv"
-    )
+# Exportar CSV
+df_export = intra_df if base_interval != '1d' else daily_df
+st.download_button("Exportar CSV", df_export.to_csv().encode('utf-8'), f"spy_{base_interval}.csv", "text/csv")
+
+
