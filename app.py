@@ -61,26 +61,46 @@ def fetch_data(symbol: str, interval: str, start_date: datetime, end_date: datet
         df.index = df.index.tz_localize('UTC')
     return df.tz_convert('America/New_York')
 
-def load_csv_df(uploaded_file) -> pd.DataFrame:
+def load_csv_df(uploaded_file, dayfirst: bool = False) -> pd.DataFrame:
+    """
+    Lee un CSV (comma o semicolon), con o sin cabecera,
+    y convierte el índice a DatetimeIndex (UTC→America/New_York).
+    Usa `dayfirst=True` para formato dd/mm/yyyy.
+    """
+    # 1. Detectar delimitador
+    delim = ','
+    try:
+        sample = uploaded_file.read(2048) if hasattr(uploaded_file, 'read') else open(uploaded_file, 'r').read(2048)
+        if hasattr(uploaded_file, 'seek'):
+            uploaded_file.seek(0)
+        sniff = csv.Sniffer().sniff(sample)
+        delim = sniff.delimiter
+    except Exception:
+        pass
+
+    # 2. Leer con cabecera o sin ella
     try:
         df = pd.read_csv(
             uploaded_file,
-            sep=';',
+            sep=delim,
+            engine='python',
             header=0,
-            index_col=0,
-            parse_dates=True
+            index_col=0
         )
     except Exception:
         df = pd.read_csv(
             uploaded_file,
-            sep=';',
+            sep=delim,
+            engine='python',
             header=None,
             names=['Datetime','Open','High','Low','Close','Volume'],
-            index_col=0,
-            parse_dates=['Datetime']
+            index_col=0
         )
+
+    # 3. Normalizar columnas y parsear índice
     df.columns = df.columns.str.strip().str.title()
-    df.index = pd.to_datetime(df.index, utc=True).tz_convert('America/New_York')
+    df.index = pd.to_datetime(df.index, utc=True, dayfirst=dayfirst)
+    df.index = df.index.tz_convert('America/New_York')
     return df
 
 # -----------------------------------
@@ -155,7 +175,7 @@ def module_close_prob(daily: pd.DataFrame):
     d['Prev_High']  = d['High'].shift(1)
     d['Prev_Low']   = d['Low'].shift(1)
 
-    # Slider de offset ahora de -5% a +5%
+    # Slider de offset entre -5% y +5%
     off = st.sidebar.slider(
         "Offset % (puede ser negativo)",
         min_value=-5.0,
@@ -163,19 +183,45 @@ def module_close_prob(daily: pd.DataFrame):
         value=0.0,
         step=0.1
     )
+    d['OffPrice'] = d['Prev_Close'] * (1 + off / 100)
 
-    # Precio objetivo con offset
-    d['OffPrice'] = d['Prev_Close'] * (1 + off/100)
+    # Validar que OffPrice esté dentro del rango del día
+    valid = (d['OffPrice'] >= d['Low']) & (d['OffPrice'] <= d['High'])
+    d_valid = d[valid].copy()
 
-    # Métricas base
-    st.write(f"% cierre > open:          {100*(d['Close']>d['Open']).mean():.2f}%")
-    st.write(f"% cierre > prev close:    {100*(d['Close']>d['Prev_Close']).mean():.2f}%")
-    st.write(f"% cierre > prev high:     {100*(d['Close']>d['Prev_High']).mean():.2f}%")
-    st.write(f"% cierre < prev low:      {100*(d['Close']<d['Prev_Low']).mean():.2f}%")
+    # Métricas generales sobre días válidos
+    if d_valid.empty:
+        st.write("No hay días donde el precio offset esté dentro del rango diario.")
+        return
+    st.write(f"Días válidos (offset en rango): {len(d_valid)}/{len(d)}")
+    st.write(f"% cierre > open:          {100*(d_valid['Close']>d_valid['Open']).mean():.2f}%")
+    st.write(f"% cierre > prev_close:    {100*(d_valid['Close']>d_valid['Prev_Close']).mean():.2f}%")
+    st.write(f"% cierre > prev_high:     {100*(d_valid['Close']>d_valid['Prev_High']).mean():.2f}%")
+    st.write(f"% cierre < prev_low:      {100*(d_valid['Close']<d_valid['Prev_Low']).mean():.2f}%")
+    st.write(f"% cierre > offset ({off:+.1f}%): {100*(d_valid['Close']>d_valid['OffPrice']).mean():.2f}%")
+    st.write(f"% cierre < offset ({off:+.1f}%): {100*(d_valid['Close']<d_valid['OffPrice']).mean():.2f}%")
 
-    # Offset positive or negative
-    st.write(f"% cierre > offset ({off:+.1f}%): {100*(d['Close']>d['OffPrice']).mean():.2f}%")
-    st.write(f"% cierre < offset ({off:+.1f}%): {100*(d['Close']<d['OffPrice']).mean():.2f}%")
+    # Filtrar las ocurrencias para descarga
+    df_above = d_valid[d_valid['Close'] > d_valid['OffPrice']]
+    df_below = d_valid[d_valid['Close'] < d_valid['OffPrice']]
+
+    # Botones de descarga
+    if not df_above.empty:
+        csv_above = df_above.to_csv(index=True).encode('utf-8')
+        st.download_button(
+            "Descargar cierres > offset (válidos)",
+            data=csv_above,
+            file_name=f"cierres_above_offset_{off:+.1f}%.csv",
+            mime="text/csv"
+        )
+    if not df_below.empty:
+        csv_below = df_below.to_csv(index=True).encode('utf-8')
+        st.download_button(
+            "Descargar cierres < offset (válidos)",
+            data=csv_below,
+            file_name=f"cierres_below_offset_{off:+.1f}%.csv",
+            mime="text/csv"
+        )
 
 
 
@@ -317,7 +363,13 @@ def module_sign_changes(intra: pd.DataFrame):
 st.title("Análisis Cuantitativo")
 
 # Sidebar: ticker input (used if no CSV)
-ticker_input = st.sidebar.text_input("Ticker (Yahoo)", value="SPY").upper()
+if 'ticker_input' not in st.session_state:
+    st.session_state.ticker_input = "SPY"
+ticker_input = st.sidebar.text_input(
+    "Ticker (Yahoo)",
+    value=st.session_state.ticker_input,
+    key='ticker_input'
+).upper()
 
 # Sidebar: CSV upload options
 use_csv_intra = st.sidebar.checkbox("Usar CSV intradía (15m)")
@@ -353,15 +405,21 @@ yahoo_interval = st.sidebar.selectbox(
 modules = st.sidebar.multiselect(
     "Selecciona módulos a ejecutar",
     ALL_MODULES,
-    default=saved_modules
+    default=st.session_state.get('modules', saved_modules),
+    key='modules'
 )
 
 # Sidebar: run button
-run = st.sidebar.button("Analizar")
+dirun = st.sidebar.button("Analizar", key="run_button")
 if 'run' not in st.session_state:
     st.session_state.run = False
-if run:
+if dirun:
     st.session_state.run = True
+    # Guardar selección de módulos para la próxima visita
+    try:
+        json.dump(st.session_state['modules'], open(CONFIG_FILE, 'w'))
+    except Exception as e:
+        st.error(f"Error guardando configuración de módulos: {e}")
 
 # Block until Analyze
 if not st.session_state.run:
@@ -427,19 +485,9 @@ start = st.sidebar.date_input("Fecha inicio", datetime(2010,1,1))
 end   = st.sidebar.date_input("Fecha fin", datetime.now().date())
 
 # Load daily data
-daily_df = None
 if use_csv_daily:
-    # CSV diario con fecha dd/mm/yyyy
-    df_temp = pd.read_csv(
-        uploaded_daily,
-        sep=';',
-        parse_dates=[0],
-        dayfirst=True,
-        index_col=0
-    )
-    df_temp.columns = df_temp.columns.str.strip().str.title()
-    df_temp.index = pd.to_datetime(df_temp.index, dayfirst=True, utc=True).tz_convert('America/New_York')
-    daily_df = df_temp
+    # Carga el CSV diario asumiendo fechas dd/mm/yyyy
+    daily_df = load_csv_df(uploaded_daily, dayfirst=True)
 else:
     daily_df = fetch_data(
         global_symbol,
