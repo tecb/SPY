@@ -3,10 +3,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import pytz
-from datetime import datetime, timedelta
-import altair as alt
 import os
 import json
+import re
+from datetime import datetime, timedelta
+import altair as alt
+import csv
 
 # -----------------------------------
 # CONFIGURATION PERSISTENCE
@@ -20,8 +22,9 @@ ALL_MODULES = [
     "5. Distribución de movimiento",
     "6. Comportamientos extremos",
     "7. Insights & señales",
-    "8. Histograma retornos diarios",
-    "9. Cambios de signo intradía"
+    "8. Histograma multi-día",
+    "9. Cambios de signo intradía",
+    "10. Testeo rangos intradía"
 ]
 if os.path.exists(CONFIG_FILE):
     try:
@@ -32,11 +35,21 @@ else:
     saved_modules = ALL_MODULES.copy()
 
 # -----------------------------------
-# UTILITIES
+# UTILIDAD: Parsear nombre de CSV
 # -----------------------------------
-def get_symbol_from_filename(filename: str) -> str:
-    return os.path.splitext(os.path.basename(filename))[0].upper()
+def parse_csv_filename(name: str):
+    """
+    Extrae símbolo e intervalo de archivos tipo SYMBOL_INTERVAL.csv
+    """
+    basename = os.path.splitext(os.path.basename(name))[0]
+    parts = re.split(r'[_\-]', basename)
+    if len(parts) >= 2:
+        return parts[0].upper(), parts[-1].lower()
+    return None, None
 
+# -----------------------------------
+# DATA & CSV UTILITIES
+# -----------------------------------
 def fetch_data(symbol: str, interval: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
     ticker = yf.Ticker(symbol)
     df = ticker.history(
@@ -50,63 +63,35 @@ def fetch_data(symbol: str, interval: str, start_date: datetime, end_date: datet
         limits = {'1m':7,'5m':59,'15m':59,'30m':59,'1h':730}
         fallback = limits.get(interval,59)
         st.warning(f"Intervalo {interval} sin datos; usando últimos {fallback} días de Yahoo.")
-        df = ticker.history(
-            period=f"{fallback}d",
-            interval=interval,
-            prepost=False,
-            auto_adjust=False
-        )
+        df = ticker.history(period=f"{fallback}d", interval=interval, prepost=False, auto_adjust=False)
     df.index = pd.to_datetime(df.index)
     if df.index.tz is None:
         df.index = df.index.tz_localize('UTC')
     return df.tz_convert('America/New_York')
 
 def load_csv_df(uploaded_file, dayfirst: bool = False) -> pd.DataFrame:
-    """
-    Lee un CSV (comma o semicolon), con o sin cabecera,
-    y convierte el índice a DatetimeIndex (UTC→America/New_York).
-    Usa `dayfirst=True` para formato dd/mm/yyyy.
-    """
-    # 1. Detectar delimitador
+    # Detect delimiter via csv.Sniffer
     delim = ','
     try:
         sample = uploaded_file.read(2048) if hasattr(uploaded_file, 'read') else open(uploaded_file, 'r').read(2048)
-        if hasattr(uploaded_file, 'seek'):
-            uploaded_file.seek(0)
+        if hasattr(uploaded_file, 'seek'): uploaded_file.seek(0)
         sniff = csv.Sniffer().sniff(sample)
         delim = sniff.delimiter
-    except Exception:
+    except:
         pass
-
-    # 2. Leer con cabecera o sin ella
     try:
-        df = pd.read_csv(
-            uploaded_file,
-            sep=delim,
-            engine='python',
-            header=0,
-            index_col=0
-        )
-    except Exception:
-        df = pd.read_csv(
-            uploaded_file,
-            sep=delim,
-            engine='python',
-            header=None,
-            names=['Datetime','Open','High','Low','Close','Volume'],
-            index_col=0
-        )
-
-    # 3. Normalizar columnas y parsear índice
+        df = pd.read_csv(uploaded_file, sep=delim, engine='python', header=0, index_col=0)
+    except:
+        df = pd.read_csv(uploaded_file, sep=delim, engine='python', header=None,
+                         names=['Datetime','Open','High','Low','Close','Volume'], index_col=0)
     df.columns = df.columns.str.strip().str.title()
     df.index = pd.to_datetime(df.index, utc=True, dayfirst=dayfirst)
     df.index = df.index.tz_convert('America/New_York')
     return df
 
 # -----------------------------------
-# MODULE IMPLEMENTATIONS
+# MODULES 1-7,8,9
 # -----------------------------------
-
 def module_daily_anatomy(df: pd.DataFrame):
     st.subheader("1. Anatomía de la vela diaria")
     d = df.copy()
@@ -115,14 +100,13 @@ def module_daily_anatomy(df: pd.DataFrame):
     d['Upper_Wick'] = d['High'] - d[['Open','Close']].max(axis=1)
     d['Lower_Wick'] = d[['Open','Close']].min(axis=1) - d['Low']
     stats = pd.DataFrame({
-        'Mean':   [d[c].mean() for c in ['Range','Body','Upper_Wick','Lower_Wick']],
-        'Median': [d[c].median() for c in ['Range','Body','Upper_Wick','Lower_Wick']],
-        'Std':    [d[c].std() for c in ['Range','Body','Upper_Wick','Lower_Wick']]
+        'Mean':[d[c].mean() for c in ['Range','Body','Upper_Wick','Lower_Wick']],
+        'Median':[d[c].median() for c in ['Range','Body','Upper_Wick','Lower_Wick']],
+        'Std':[d[c].std() for c in ['Range','Body','Upper_Wick','Lower_Wick']]
     }, index=['Range','Body','Upper_Wick','Lower_Wick'])
     st.table(stats)
     st.write(f"% Alcista: {100*(d['Close']>d['Open']).mean():.2f}%")
     st.write(f"% Bajista: {100*(d['Close']<d['Open']).mean():.2f}%")
-
 
 def module_intraday_reversion(intra: pd.DataFrame, daily: pd.DataFrame):
     st.subheader("2. Estadísticas de reversión intradía")
@@ -137,20 +121,19 @@ def module_intraday_reversion(intra: pd.DataFrame, daily: pd.DataFrame):
         if pd.isna(prev_close): continue
         o, c = grp['Open'].iloc[0], grp['Close'].iloc[-1]
         rev = (o<prev_close and c>o) or (o>prev_close and c<o)
-        d = {'Day':day, 'Reverted':rev, 'Gap%':100*(o/prev_close-1)}
+        rec = {'Day':day, 'Reverted':rev, 'Gap%':100*(o/prev_close-1)}
         if c>o:
-            d['Min%']=100*(grp['Low'].min()/o-1)
-            d['T_Min']=grp.loc[grp['Low'].idxmin(),'Datetime'].time()
+            rec['Min%']=100*(grp['Low'].min()/o-1)
+            rec['T_Min']=grp.loc[grp['Low'].idxmin(),'Datetime'].time()
         else:
-            d['Max%']=100*(grp['High'].max()/o-1)
-            d['T_Max']=grp.loc[grp['High'].idxmax(),'Datetime'].time()
-        results.append(d)
-    res = pd.DataFrame(results)
+            rec['Max%']=100*(grp['High'].max()/o-1)
+            rec['T_Max']=grp.loc[grp['High'].idxmax(),'Datetime'].time()
+        results.append(rec)
+    res=pd.DataFrame(results)
     if res.empty:
-        st.write("No se detectaron reversiones.")
+        st.write("No reversiones detectadas.")
         return
-    st.write(f"Prob. reversión: {100*res['Reverted'].mean():.2f}%")
-
+    st.write(f"Prob. reversión intradía: {100*res['Reverted'].mean():.2f}%")
 
 def module_chrono(intra: pd.DataFrame):
     st.subheader("3. Cronoanálisis intradía")
@@ -161,179 +144,144 @@ def module_chrono(intra: pd.DataFrame):
     df3['Block'] = df3['Datetime'].dt.strftime('%H:%M')
     df3['Ret%']  = 100*(df3['Close']/df3['Open']-1)
     summary = df3.groupby('Block')['Ret%'].agg(['mean','std','count'])
-    summary['Up%'] = df3.groupby('Block').apply(lambda g:(g['Close']>g['Open']).mean()*100)
+    summary['Up%']=df3.groupby('Block').apply(lambda g:(g['Close']>g['Open']).mean()*100)
     st.line_chart(summary[['mean','Up%']])
-    seq = (df3['Close']>df3['Open']).astype(int)
-    trans = pd.crosstab(seq.shift(), seq, normalize='index')*100
+    seq=(df3['Close']>df3['Open']).astype(int)
+    trans=pd.crosstab(seq.shift(), seq, normalize='index')*100
     st.write("Matriz transiciones (%):")
     st.table(trans)
 
 def module_close_prob(daily: pd.DataFrame):
     st.subheader("4. Probabilidades de cierre relativo")
-    d = daily.copy()
-    d['Prev_Close'] = d['Close'].shift(1)
-    d['Prev_High']  = d['High'].shift(1)
-    d['Prev_Low']   = d['Low'].shift(1)
-
-    # Slider de offset entre -5% y +5%
-    off = st.sidebar.slider(
-        "Offset % (puede ser negativo)",
-        min_value=-5.0,
-        max_value=5.0,
-        value=0.0,
-        step=0.1
-    )
-    d['OffPrice'] = d['Prev_Close'] * (1 + off / 100)
-
-    # Validar que OffPrice esté dentro del rango del día
-    valid = (d['OffPrice'] >= d['Low']) & (d['OffPrice'] <= d['High'])
-    d_valid = d[valid].copy()
-
-    # Métricas generales sobre días válidos
+    d=daily.copy()
+    d['Prev_Close']=d['Close'].shift(1)
+    d['Prev_High']=d['High'].shift(1)
+    d['Prev_Low']=d['Low'].shift(1)
+    off=st.sidebar.slider("Offset % (negativo a positivo)", -5.0,5.0,0.5,0.1)
+    d['OffPrice']=d['Prev_Close']*(1+off/100)
+    valid=(d['OffPrice']>=d['Low'])&(d['OffPrice']<=d['High'])
+    d_valid=d[valid]
     if d_valid.empty:
-        st.write("No hay días donde el precio offset esté dentro del rango diario.")
+        st.write("No hay días con offset en rango.")
         return
-    st.write(f"Días válidos (offset en rango): {len(d_valid)}/{len(d)}")
-    st.write(f"% cierre > open:          {100*(d_valid['Close']>d_valid['Open']).mean():.2f}%")
-    st.write(f"% cierre > prev_close:    {100*(d_valid['Close']>d_valid['Prev_Close']).mean():.2f}%")
-    st.write(f"% cierre > prev_high:     {100*(d_valid['Close']>d_valid['Prev_High']).mean():.2f}%")
-    st.write(f"% cierre < prev_low:      {100*(d_valid['Close']<d_valid['Prev_Low']).mean():.2f}%")
-    st.write(f"% cierre > offset ({off:+.1f}%): {100*(d_valid['Close']>d_valid['OffPrice']).mean():.2f}%")
-    st.write(f"% cierre < offset ({off:+.1f}%): {100*(d_valid['Close']<d_valid['OffPrice']).mean():.2f}%")
-
-    # Filtrar las ocurrencias para descarga
-    df_above = d_valid[d_valid['Close'] > d_valid['OffPrice']]
-    df_below = d_valid[d_valid['Close'] < d_valid['OffPrice']]
-
-    # Botones de descarga
+    st.write(f"Días válidos: {len(d_valid)} / {len(d)}")
+    st.write(f"% cierre>offset ({off:+.1f}%): {100*(d_valid['Close']>d_valid['OffPrice']).mean():.2f}%")
+    df_above=d_valid[d_valid['Close']>d_valid['OffPrice']]
+    df_below=d_valid[d_valid['Close']<d_valid['OffPrice']]
     if not df_above.empty:
-        csv_above = df_above.to_csv(index=True).encode('utf-8')
-        st.download_button(
-            "Descargar cierres > offset (válidos)",
-            data=csv_above,
-            file_name=f"cierres_above_offset_{off:+.1f}%.csv",
-            mime="text/csv"
-        )
+        st.download_button("Descargar cierres>offset", df_above.to_csv().encode(), f"above_{off}.csv","text/csv")
     if not df_below.empty:
-        csv_below = df_below.to_csv(index=True).encode('utf-8')
-        st.download_button(
-            "Descargar cierres < offset (válidos)",
-            data=csv_below,
-            file_name=f"cierres_below_offset_{off:+.1f}%.csv",
-            mime="text/csv"
-        )
-
-
+        st.download_button("Descargar cierres<offset", df_below.to_csv().encode(), f"below_{off}.csv","text/csv")
 
 def module_distribution(daily: pd.DataFrame):
     st.subheader("5. Distribución de movimiento")
-    # Cálculo del rango porcentual
-    df = daily.copy()
-    df['Range%'] = 100 * (df['High'] - df['Low']) / df['Open']
-    r = df['Range%']
-
-    # Determinar el máximo absoluto para el dominio (-max, +max)
-    max_r = r.max()
-    domain_max = round(max_r + 0.1, 1)
-    domain = [0, domain_max]
-
-    # Histograma con bins de 0.1% y dominio simétrico, interactivo para zoom
-    chart = (
-        alt.Chart(df)
+    df=daily.copy()
+    df['Range%']=100*(df['High']-df['Low'])/df['Open']
+    r=df['Range%']
+    max_r=r.max(); domain_max=round(max_r+0.1,1)
+    domain=[-domain_max,domain_max]
+    chart=(alt.Chart(df)
            .mark_bar()
            .encode(
-               alt.X('Range%:Q',
-                     bin=alt.Bin(step=0.1, extent=domain),
-                     title='Rango % (bins de 0.1%)'),
-               y=alt.Y('count()', title='Frecuencia')
-           )
-           .properties(
-               title='Distribución de amplitud intradía'
-           )
-           .interactive()   # <— Habilita zoom rectangular y paneo
-    )
-    st.altair_chart(chart, use_container_width=True)
-	
+               alt.X('Range%:Q', bin=alt.Bin(step=0.1, extent=domain), title='Range%'),
+               y='count()')
+           .properties(title='Distribución amplitud')
+           .interactive())
+    st.altair_chart(chart,use_container_width=True)
 
 def module_extremes(daily: pd.DataFrame):
     st.subheader("6. Comportamientos extremos")
-    d = daily.copy()
+    d=daily.copy()
     d['Gap%']=100*(d['Open']/d['Close'].shift(1)-1)
-    st.write("Top 5 gaps %:")
     st.table(d['Gap%'].abs().nlargest(5))
     d['Size%']=100*(d['Close']/d['Open']-1)
-    st.write("Top 5 velas %:")
     st.table(d['Size%'].abs().nlargest(5))
-
 
 def module_insights(daily: pd.DataFrame):
     st.subheader("7. Insights & señales")
-    st.markdown(
-        "Este módulo detecta patrones de velas clásicos y evalúa su rendimiento al día siguiente."
-    )
-
-    # Preparamos el DataFrame
-    d = daily.copy()
-    d['Body']       = (d['Close'] - d['Open']).abs()
-    d['Lower_Wick'] = d[['Open','Close']].min(axis=1) - d['Low']
-    d['Upper_Wick'] = d['High'] - d[['Open','Close']].max(axis=1)
-    prev = d.shift(1)
-
-    # Definición de patrones
-    patterns = {
-        'Hammer':            (d['Lower_Wick'] > 2*d['Body']) & (d['Close'] > d['Open']),
-        'Shooting Star':     (d['Upper_Wick'] > 2*d['Body']) & (d['Close'] < d['Open']),
-        'Marubozu':          d['Body'] >= 0.9*(d['High'] - d['Low']),
-        'Doji':              d['Body'] <= 0.05*(d['High'] - d['Low']),
-        'Engulfing Alcista': (d['Close'] > d['Open']) & (d['Open'] < prev['Close']) & (d['Close'] > prev['Open']),
-        'Engulfing Bajista': (d['Close'] < d['Open']) & (d['Open'] > prev['Close']) & (d['Close'] < prev['Open']),
+    st.markdown("Detecta patrones de velas clásicos y su retorno al día siguiente.")
+    d=daily.copy()
+    d['Body']=abs(d['Close']-d['Open'])
+    d['Lower_Wick']=d[['Open','Close']].min(axis=1)-d['Low']
+    d['Upper_Wick']=d['High']-d[['Open','Close']].max(axis=1)
+    prev=d.shift(1)
+    patterns={
+        'Hammer':(d['Lower_Wick']>2*d['Body'])&(d['Close']>d['Open']),
+        'Shooting Star':(d['Upper_Wick']>2*d['Body'])&(d['Close']<d['Open']),
+        'Marubozu': d['Body']>=0.9*(d['High']-d['Low']),
+        'Doji': d['Body']<=0.05*(d['High']-d['Low']),
+        'Engulfing Alcista':(d['Close']>d['Open'])&(d['Open']<prev['Close'])&(d['Close']>prev['Open']),
+        'Engulfing Bajista':(d['Close']<d['Open'])&(d['Open']>prev['Close'])&(d['Close']<prev['Open'])
     }
-
-    # Calculamos el retorno del día siguiente en %
-    next_return = (d['Close'].shift(-1) / d['Open'].shift(-1) - 1) * 100
-
-    # Preparamos filas para la tabla resumen
-    rows = []
-    for name, mask in patterns.items():
-        count = int(mask.sum())
-        avg_ret = next_return[mask].mean() if count > 0 else np.nan
-        rows.append((name, count, round(avg_ret,2)))
-        st.markdown(f"- **{name}**: {count} días — Next Day Avg Return: {avg_ret:.2f}%")
-
-    # Construimos y mostramos la tabla final
-    summary = pd.DataFrame(
-        rows,
-        columns=['Patrón','Frecuencia','Avg Retorno 1D (%)']
-    ).set_index('Patrón')
+    next_ret=(d['Close'].shift(-1)/d['Open'].shift(-1)-1)*100
+    rows=[]
+    for name,mask in patterns.items():
+        cnt=int(mask.sum())
+        avg=next_ret[mask].mean() if cnt>0 else np.nan
+        rows.append((name,cnt,round(avg,2)))
+        st.markdown(f"- **{name}**: {cnt} días — Retorno 1D avg: {avg:.2f}%")
+    summary=pd.DataFrame(rows,columns=['Patrón','Frecuencia','Avg Retorno 1D (%)']).set_index('Patrón')
     st.table(summary)
 
 
-def module_returns_histogram(daily: pd.DataFrame):
-    st.subheader("8. Histograma retornos diarios")
-    # Calcular retorno diario %
-    df = daily.copy()
-    df['Ret%'] = 100 * (df['Close'] / df['Open'] - 1)
-    series = df['Ret%']
+# -----------------------------------
+# MÓDULO 8. Histograma multi-día
+# -----------------------------------
+def module_multi_day_histogram(daily: pd.DataFrame):
+    """
+    Muestra la distribución de retornos sobre ventanas de N días.
+    El usuario elige N, y cada barra del histograma representa
+    el retorno porcentual de ese bloque de N días.
+    """
+    st.subheader("8. Histograma de retornos multi-día")
 
-    # Dominio simétrico basado en el valor absoluto máximo
-    max_r = series.abs().max()
-    domain_max = round(max_r + 0.1, 1)
-    extent = [-domain_max, domain_max]
-
-    # Histograma con bins de 0.1% y zoom interactivo
-    chart = (
-        alt.Chart(df)
-           .mark_bar()
-           .encode(
-               alt.X('Ret%:Q',
-                     bin=alt.Bin(step=0.1, extent=extent),
-                     title='Retorno diario (%)'),
-               alt.Y('count()', title='Frecuencia')
-           )
-           .properties(title='Histograma retornos diarios')
-           .interactive()   # habilita zoom rectangular y paneo
+    # 1) Selector de ventana
+    window = st.slider(
+        "Ventana (días)", 
+        min_value=1, 
+        max_value=60, 
+        value=5, 
+        step=1
     )
+
+    # 2) Calcular retornos % de cada bloque de N días
+    # pct_change con periodos=window: (C_t / C_{t-window} - 1)
+    returns = daily['Close'].pct_change(periods=window) * 100
+
+    # 3) Limpiar NaN iniciales
+    df = returns.dropna().to_frame(name='Retorno%')
+    df['Grupo'] = (np.arange(len(df)) // 1).astype(int)  # índice numérico
+
+    # 4) Histograma con bins de 0.1% y zoom interactivo
+    # Dominio simétrico
+    max_abs = abs(df['Retorno%']).max()
+    domain = [-round(max_abs+0.1,1), round(max_abs+0.1,1)]
+
+    chart = (
+        alt.Chart(df.reset_index())
+            .mark_bar()
+            .encode(
+                alt.X('Retorno%:Q', 
+                      bin=alt.Bin(step=0.1, extent=domain), 
+                      title=f'Retorno {window} días (%)'),
+                alt.Y('count()', title='Frecuencia')
+            )
+            .properties(
+                title=f'Histograma de retornos en bloques de {window} días'
+            )
+            .interactive()  # permite zoom rectangular
+    )
+
     st.altair_chart(chart, use_container_width=True)
+
+    # 5) Botón de descarga de los retornos calculados
+    csv = df['Retorno%'].to_csv().encode('utf-8')
+    st.download_button(
+        f"Descargar retornos {window}d (%)", 
+        data=csv, 
+        file_name=f"retornos_{window}d.csv", 
+        mime="text/csv"
+    )
 
 
 
@@ -342,233 +290,256 @@ def module_sign_changes(intra: pd.DataFrame):
     if intra.empty:
         st.info("No hay datos intradía.")
         return
-    # Cálculo de cierre diario a partir de intradía
-    daily_close_series = intra['Close'].resample('D').last().dropna()
-    # Mapear por fecha (date) sin zona horaria
-    daily_close_by_date = {ts.date(): price for ts, price in daily_close_series.items()}
-
-    # Preparar DataFrame base
-    df2 = intra.reset_index().rename(columns={intra.index.name or 'index':'Datetime'})
-    df2['Day'] = df2['Datetime'].dt.date
-    records = []
-    for day, grp in df2.groupby('Day'):
-        prev_date = day - timedelta(days=1)
-        pc = daily_close_by_date.get(prev_date, np.nan)
-        if pd.isna(pc):
-            continue
-        # Serie de signos: 1 si Close > pc, 0 en caso contrario
-        sig = (grp['Close'] > pc).astype(int)
-        # Detectar cambios de signo (0->1 o 1->0)
-        change_points = sig.diff().abs() == 1
-        idxs = np.where(change_points)[0]
-        cnt = len(idxs)
-        if cnt == 0:
-            continue
-        if cnt > 1:
-            diffs = np.diff(idxs)
-            min_i = int(diffs.min())
-            max_i = int(idxs[-1] - idxs[0])
-        else:
-            min_i = max_i = 0
-        records.append({'Day': day, 'SignChanges': cnt, 'MinInterval': min_i, 'MaxInterval': max_i})
-    if not records:
+    daily_close=intra['Close'].resample('D').last().dropna()
+    close_map={ts.date():p for ts,p in daily_close.items()}
+    df2=intra.reset_index().rename(columns={intra.index.name or 'index':'Datetime'})
+    df2['Day']=df2['Datetime'].dt.date
+    rec=[]
+    for day,grp in df2.groupby('Day'):
+        pc=close_map.get(day-timedelta(days=1),np.nan)
+        if np.isnan(pc): continue
+        sig=(grp['Close']>pc).astype(int)
+        ch=(sig.diff().abs()==1)
+        idxs=np.where(ch)[0]
+        cnt=len(idxs)
+        if cnt==0: continue
+        if cnt>1:
+            diffs=np.diff(idxs);mi=int(diffs.min());ma=int(idxs[-1]-idxs[0])
+        else: mi=ma=0
+        rec.append({'Day':day,'SignChanges':cnt,'MinInterval':mi,'MaxInterval':ma})
+    if not rec:
         st.write("Sin cambios de signo detectados.")
         return
-    df_rec = pd.DataFrame(records).set_index('Day')
+    df_rec=pd.DataFrame(rec).set_index('Day')
     st.dataframe(df_rec)
-    st.write(f"Promedio cambios: {df_rec['SignChanges'].mean():.2f}")
-    st.write(f"Intervalo mínimo promedio: {df_rec['MinInterval'].mean():.2f} velas")
-    st.write(f"Intervalo máximo promedio: {df_rec['MaxInterval'].mean():.2f} velas")
-    hist = (
-        alt.Chart(df_rec.reset_index())
-        .mark_bar()
-        .encode(
-            x=alt.X('SignChanges:Q', bin=alt.Bin(step=1), title='Nº cambios'),
-            y=alt.Y('count():Q', title='Frecuencia')
-        )
-        .properties(title='Histograma de cambios de signo intradía')
+    st.write(f"Prom cambios: {df_rec['SignChanges'].mean():.2f}")
+    st.write(f"Min int avg: {df_rec['MinInterval'].mean():.2f} velas")
+    st.write(f"Max int avg: {df_rec['MaxInterval'].mean():.2f} velas")
+    hist=(alt.Chart(df_rec.reset_index())
+          .mark_bar()
+          .encode(
+              x=alt.X('SignChanges:Q',bin=alt.Bin(step=1),title='Cambios'),
+              y=alt.Y('count():Q',title='Frecuencia'))
+          .properties(title='Histograma cambios de signo')
+          .interactive())
+    st.altair_chart(hist,use_container_width=True)
+
+# -----------------------------------
+# MÓDULO 10: Testeo de rangos intradía
+# -----------------------------------
+def module_intraday_range_test(intra: pd.DataFrame, daily: pd.DataFrame):
+    """
+    Testea rangos intradía porcentuales respecto al cierre del día anterior
+    sobre todo el histórico y muestra estadísticas de escapes y tiempos.
+    """
+    st.subheader("10. Testeo de Rangos Intradía vs. Cierre Anterior")
+    # Parámetros de usuario
+    c1,c2,c3,c4 = st.columns(4)
+    with c1:
+        offset_min = st.number_input("Offset mínimo (%)", 0.0, 5.0, 0.2, 0.1)
+    with c2:
+        offset_max = st.number_input("Offset máximo (%)", offset_min, 5.0, 1.0, 0.1)
+    with c3:
+        step = st.number_input("Paso (%)", 0.01, 1.0, 0.1, 0.01)
+    with c4:
+        days_hist = st.number_input("Días históricos", 1, 365, 60, 1)
+
+    # Preparar DataFrame con retornos vs cierre previo
+    df = intra.copy()
+    df['Date'] = df.index.date
+    # Mapear cierre previo por fecha (date)
+    prev_map = {ts.date(): price for ts, price in daily['Close'].shift(1).items()}
+    df['Prev_Close'] = df['Date'].map(prev_map)
+    df = df.dropna(subset=['Prev_Close'])
+    if df.empty:
+        st.write("No hay datos intradía válidos para el período seleccionado.")
+        return
+    df['Ret%'] = (df['Close'] - df['Prev_Close']) / df['Prev_Close'] * 100
+
+    # Filtrar últimos N días
+    unique_days = sorted(df['Date'].unique())
+    if not unique_days:
+        st.write("No hay días intradía válidos para el período seleccionado.")
+        return
+    recent_days = unique_days[-days_hist:]
+    df = df[df['Date'].isin(recent_days)]
+    total_days = len(recent_days)
+
+    results = []
+    offs = np.arange(offset_min, offset_max + 1e-9, step)
+    for X in offs:
+        lower, upper = -X, X
+        clean_escapes = 0
+        false_escapes = 0
+        time_in_range = []
+        time_to_escape = []
+
+        for d, grp in df.groupby('Date'):
+            ret = grp['Ret%'].values
+            # Velas dentro del rango
+            in_range = (ret >= lower) & (ret <= upper)
+            time_in_range.append(in_range.sum())
+            # Detectar primer escape
+            escap = np.where((ret < lower) | (ret > upper))[0]
+            if escap.size == 0:
+                continue
+            idx0 = int(escap[0])
+            time_to_escape.append(idx0)
+            after = ret[idx0+1:] if idx0 + 1 < len(ret) else np.array([])
+            if np.any(np.isclose(after, 0.0, atol=1e-6)):
+                false_escapes += 1
+            else:
+                clean_escapes += 1
+
+        escapes = clean_escapes + false_escapes
+        stats = {'Rango': f"±{X:.2f}%"}
+        # Evitar división por cero
+        stats['% Días que rompen'] = (escapes / total_days * 100) if total_days else np.nan
+        stats['% Escapes Limpios'] = (clean_escapes / escapes * 100) if escapes else np.nan
+        stats['% Falsos Escapes'] = (false_escapes / escapes * 100) if escapes else np.nan
+        stats['Tiempo Medio en Rango'] = np.mean(time_in_range) if time_in_range else np.nan
+        stats['Tiempo Medio a Escape'] = np.mean(time_to_escape) if time_to_escape else np.nan
+
+        results.append(stats)
+
+    df_res = pd.DataFrame(results).set_index('Rango')
+    st.table(df_res)
+
+    # Gráfico de escapes limpios
+    chart1 = (
+        alt.Chart(df_res.reset_index())
+           .mark_bar()
+           .encode(
+               x='Rango:N',
+               y='% Escapes Limpios:Q',
+               tooltip=['% Días que rompen', '% Falsos Escapes']
+           )
+           .properties(title='% Escapes Limpios por Rango')
+           .interactive()
     )
-    st.altair_chart(hist, use_container_width=True)
+    st.altair_chart(chart1, use_container_width=True)
+
+    # Gráfico de tiempo hasta escape
+    chart2 = (
+        alt.Chart(df_res.reset_index())
+           .mark_line(point=True)
+           .encode(
+               x='Rango:N',
+               y='Tiempo Medio a Escape:Q',
+               tooltip=['Tiempo Medio en Rango']
+           )
+           .properties(title='Tiempo Medio hasta Escape por Rango')
+           .interactive()
+    )
+    st.altair_chart(chart2, use_container_width=True)
+
+    # Exportar resultados
+    csv = df_res.to_csv().encode('utf-8')
+    st.download_button("Exportar resultados rangos", csv, "rangos_intradia.csv", "text/csv")
+
 
 # -----------------------------------
 # MAIN APP
 # -----------------------------------
 st.title("Análisis Cuantitativo")
-
-# Sidebar: ticker input (used if no CSV)
-if 'ticker_input' not in st.session_state:
-    st.session_state.ticker_input = "SPY"
-ticker_input = st.sidebar.text_input(
-    "Ticker (Yahoo)",
-    value=st.session_state.ticker_input,
-    key='ticker_input'
-).upper()
-
-# Sidebar: CSV upload options
-use_csv_intra = st.sidebar.checkbox("Usar CSV intradía (15m)")
-uploaded_intra = None
+# Ticker input
+if 'ticker_input' not in st.session_state: st.session_state.ticker_input='SPY'
+ticker_input=st.sidebar.text_input("Ticker (Yahoo)",value=st.session_state.ticker_input,key='ticker_input').upper()
+# CSV intradía
+use_csv_intra=st.sidebar.checkbox("Usar CSV intradía (15m)")
+uploaded_intra=None
 if use_csv_intra:
-    # Listar archivos *_15m.csv en carpeta historicos
-    import re
-    intra_files = [f for f in os.listdir('historicos') if re.match(r'.+_15m\.csv$', f, re.IGNORECASE)]
+    intra_files=[f for f in os.listdir('historicos') if re.match(r'.+_15m\.csv$',f, re.IGNORECASE)]
     if intra_files:
-        selected_intra = st.sidebar.selectbox("Selecciona CSV intradía", intra_files)
-        uploaded_intra = os.path.join('historicos', selected_intra)
+        sel_i=st.sidebar.selectbox("Selecciona CSV intradía", intra_files, key='sel_intra')
+        uploaded_intra=os.path.join('historicos',sel_i)
     else:
-        st.sidebar.warning("No se encontraron CSV intradía en carpeta 'historicos'.")
-
-use_csv_daily = st.sidebar.checkbox("Usar CSV diario (1d)")
-uploaded_daily = None
+        st.sidebar.warning("No hay CSV intradía en 'historicos'.")
+# CSV diario
+use_csv_daily=st.sidebar.checkbox("Usar CSV diario (1d)")
+uploaded_daily=None
 if use_csv_daily:
-    # Listar archivos *_1d.csv o *_daily.csv en carpeta historicos
-    import re
-    daily_files = [f for f in os.listdir('historicos') if re.match(r'.+_(1d|daily)\.csv$', f, re.IGNORECASE)]
+    daily_files=[f for f in os.listdir('historicos') if re.match(r'.+_(1d|daily)\.csv$',f,re.IGNORECASE)]
     if daily_files:
-        selected_daily = st.sidebar.selectbox("Selecciona CSV diario", daily_files)
-        uploaded_daily = os.path.join('historicos', selected_daily)
+        sel_d=st.sidebar.selectbox("Selecciona CSV diario", daily_files, key='sel_daily')
+        uploaded_daily=os.path.join('historicos',sel_d)
     else:
-        st.sidebar.warning("No se encontraron CSV diarios en carpeta 'historicos'.")
-
-# Sidebar: Yahoo interval selector for intradía when not using CSV intradía for intradía when not using CSV intradía
-yahoo_interval = st.sidebar.selectbox(
-    "Intervalo intradía Yahoo", ['1h','30m','15m','5m','1m'], index=2
-)
-
-# Sidebar: module selection
-modules = st.sidebar.multiselect(
-    "Selecciona módulos a ejecutar",
-    ALL_MODULES,
-    default=st.session_state.get('modules', saved_modules),
-    key='modules'
-)
-
-# Sidebar: run button
-dirun = st.sidebar.button("Analizar", key="run_button")
-if 'run' not in st.session_state:
-    st.session_state.run = False
-if dirun:
-    st.session_state.run = True
-    # Guardar selección de módulos para la próxima visita
-    try:
-        json.dump(st.session_state['modules'], open(CONFIG_FILE, 'w'))
-    except Exception as e:
-        st.error(f"Error guardando configuración de módulos: {e}")
-
-# Block until Analyze
+        st.sidebar.warning("No hay CSV diario en 'historicos'.")
+# Yahoo intervalo intradía si no CSV
+yahoo_interval=st.sidebar.selectbox("Intervalo intradía Yahoo",['1h','30m','15m','5m','1m'],index=2)
+# Módulos
+d_modules=st.sidebar.multiselect("Módulos a ejecutar",ALL_MODULES,default=saved_modules,key='modules')
+# Botón analizar
+run_btn=st.sidebar.button("Analizar",key='run_btn')
+if 'run' not in st.session_state: st.session_state.run=False
+if run_btn:
+    st.session_state.run=True
+    try: json.dump(st.session_state['modules'],open(CONFIG_FILE,'w'))
+    except: pass
 if not st.session_state.run:
     st.info("Configura y pulsa 'Analizar'.")
     st.stop()
-
-# Helper to parse CSV filename: SYMBOL_INTERVAL.csv
-import re
-
-def parse_csv_filename(name: str):
-    basename = os.path.splitext(os.path.basename(name))[0]
-    parts = re.split(r'[_\-]', basename)
-    if len(parts) >= 2:
-        sym = parts[0].upper()
-        intr = parts[-1].lower()
-        return sym, intr
-    return None, None
-
-# Determine symbol and data source consistency
-# Intradía CSV
-symbol_intra = ticker_input
+# Validación símbolos
+symbol_intra=ticker_input
 if use_csv_intra:
-    if not uploaded_intra:
-        st.error("Debe cargar el CSV intradía.")
-        st.stop()
-    sym_i, int_i = parse_csv_filename(uploaded_intra)  # corregido: usar archivo intradía
-    if int_i != '15m':
-        st.error(f"Intervalo inválido en nombre CSV intradía: {int_i}. Debe ser '15m'.")
-        st.stop()
-    symbol_intra = sym_i
-# Diario CSV
-symbol_daily = ticker_input
+    sym_i,interval_i=parse_csv_filename(uploaded_intra)
+    if interval_i.lower()!='15m': st.error(f"CSV intradía inválido: {interval_i}"); st.stop()
+    symbol_intra=sym_i
+symbol_daily=ticker_input
 if use_csv_daily:
-    if not uploaded_daily:
-        st.error("Debe cargar el CSV diario.")
-        st.stop()
-    sym_d, int_d = parse_csv_filename(uploaded_daily)  # corregido: parsear ruta de CSV diario directamente
-    if int_d not in ('1d','daily'):
-        st.error(f"Intervalo inválido en nombre CSV diario: {int_d}. Debe ser '1d'.")
-        st.stop()
-    symbol_daily = sym_d
-# Ensure same symbol
-global_symbol = symbol_intra
+    sym_d,interval_d=parse_csv_filename(uploaded_daily)
+    if interval_d.lower() not in ('1d','daily'): st.error(f"CSV diario inválido: {interval_d}"); st.stop()
+    symbol_daily=sym_d
+if use_csv_intra and not use_csv_daily and ticker_input!=symbol_intra:
+    st.error(f"Ticker ≠ CSV intradía: {ticker_input} vs {symbol_intra}"); st.stop()
+if use_csv_daily and not use_csv_intra and ticker_input!=symbol_daily:
+    st.error(f"Ticker ≠ CSV diario: {ticker_input} vs {symbol_daily}"); st.stop()
+if use_csv_intra and use_csv_daily and symbol_intra!=symbol_daily:
+    st.error("Símbolos intradía y diario difieren."); st.stop()
+asset_symbol=symbol_intra if use_csv_intra else symbol_daily
+st.subheader(f"Activo: {asset_symbol}")
+# Fechas
+start=st.sidebar.date_input("Fecha inicio",datetime(2010,1,1))
+end=st.sidebar.date_input("Fecha fin",datetime.now().date())
+# Carga diarios
 if use_csv_daily:
-    if symbol_daily != symbol_intra:
-        st.error(f"Mismatch de símbolo entre intradía ({symbol_intra}) y diario ({symbol_daily}).")
-        st.stop()
-elif not use_csv_intra:
-    global_symbol = ticker_input
-
-# Validate consistency with ticker_input
-if use_csv_intra and not use_csv_daily and ticker_input != symbol_intra:
-    st.error(f"El ticker seleccionado ({ticker_input}) no coincide con el activo del CSV intradía ({symbol_intra}).")
-    st.stop()
-if use_csv_daily and not use_csv_intra and ticker_input != symbol_daily:
-    st.error(f"El ticker seleccionado ({ticker_input}) no coincide con el activo del CSV diario ({symbol_daily}).")
-    st.stop()
-# Display asset
-st.subheader(f"Activo: {global_symbol}")
-
-# Date range inputs
-start = st.sidebar.date_input("Fecha inicio", datetime(2010,1,1))
-end   = st.sidebar.date_input("Fecha fin", datetime.now().date())
-
-# Load daily data
-if use_csv_daily:
-    # Carga el CSV diario asumiendo fechas dd/mm/yyyy
-    daily_df = load_csv_df(uploaded_daily, dayfirst=True)
+    daily_df=load_csv_df(uploaded_daily,dayfirst=True)
 else:
-    daily_df = fetch_data(
-        global_symbol,
-        '1d',
-        datetime.combine(start, datetime.min.time()),
-        datetime.combine(end, datetime.min.time())
-    )
-
-# Load intraday data
-intra_df = None
+    daily_df=fetch_data(asset_symbol,'1d',datetime.combine(start,datetime.min.time()),datetime.combine(end,datetime.min.time()))
+# Carga intradía
 if use_csv_intra:
-    intra_df = load_csv_df(uploaded_intra)
+    intra_df=load_csv_df(uploaded_intra)
 else:
-    intra_df = fetch_data(global_symbol, yahoo_interval, datetime.combine(start, datetime.min.time()), datetime.combine(end, datetime.min.time()))
-
-# Optional raw display
+    intra_df=fetch_data(asset_symbol,yahoo_interval,datetime.combine(start,datetime.min.time()),datetime.combine(end,datetime.min.time()))
+# Mostrar brutos opcional
 if st.sidebar.checkbox("Mostrar datos brutos intradía"):
     st.subheader("Datos intradía brutos")
     st.write(intra_df.head())
+# Ejecutar módulos
+for m in d_modules:
+    if m.startswith('1'): module_daily_anatomy(daily_df)
+    if m.startswith('2'): module_intraday_reversion(intra_df,daily_df)
+    if m.startswith('3'): module_chrono(intra_df)
+    if m.startswith('4'): module_close_prob(daily_df)
+    if m.startswith('5'): module_distribution(daily_df)
+    if m.startswith('6'): module_extremes(daily_df)
+    if m.startswith('7'): module_insights(daily_df)
+    if m.startswith('8'): module_multi_day_histogram(daily_df)
+    if m.startswith('9'): module_sign_changes(intra_df)
+    if m.startswith('10'): module_intraday_range_test(intra_df,daily_df)    
 
-# Execute selected modules
+# Exportar último dataset
+
 df_export = None
-for m in modules:
-    if m.startswith('1'):
-        module_daily_anatomy(daily_df)
-    if m.startswith('2'):
-        module_intraday_reversion(intra_df, daily_df)
-    if m.startswith('3'):
-        module_chrono(intra_df)
-    if m.startswith('4'):
-        module_close_prob(daily_df)
-    if m.startswith('5'):
-        module_distribution(daily_df)
-    if m.startswith('6'):
-        module_extremes(daily_df)
-    if m.startswith('7'):
-        module_insights(daily_df)
-    if m.startswith('8'):
-        module_returns_histogram(daily_df)
-    if m.startswith('9'):
-        module_sign_changes(intra_df)
-    df_export = intra_df if m.startswith(('2','3','9','5','8')) else daily_df
+if any(str(m).startswith(tuple(['2','3','5','8','9','10'])) for m in d_modules):
+    df_export = intra_df
+elif any(str(m).startswith(tuple(['1','4','6','7'])) for m in d_modules):
+    df_export = daily_df
 
-# Export CSV of last dataset used
 if df_export is not None:
     st.download_button(
         "Exportar CSV",
         df_export.to_csv().encode('utf-8'),
-        f"{global_symbol}_data.csv",
+        f"{asset_symbol}_data.csv",
         "text/csv"
     )
