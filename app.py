@@ -445,16 +445,16 @@ st.title("Análisis Cuantitativo")
 # Ticker input
 if 'ticker_input' not in st.session_state: st.session_state.ticker_input='SPY'
 ticker_input=st.sidebar.text_input("Ticker (Yahoo)",value=st.session_state.ticker_input,key='ticker_input').upper()
-# CSV intradía
-use_csv_intra=st.sidebar.checkbox("Usar CSV intradía (15m)")
-uploaded_intra=None
-if use_csv_intra:
-    intra_files=[f for f in os.listdir('historicos') if re.match(r'.+_15m\.csv$',f, re.IGNORECASE)]
-    if intra_files:
-        sel_i=st.sidebar.selectbox("Selecciona CSV intradía", intra_files, key='sel_intra')
-        uploaded_intra=os.path.join('historicos',sel_i)
-    else:
-        st.sidebar.warning("No hay CSV intradía en 'historicos'.")
+# # CSV intradía
+# use_csv_intra=st.sidebar.checkbox("Usar CSV intradía (15m)")
+# uploaded_intra=None
+# if use_csv_intra:
+    # intra_files=[f for f in os.listdir('historicos') if re.match(r'.+_15m\.csv$',f, re.IGNORECASE)]
+    # if intra_files:
+        # sel_i=st.sidebar.selectbox("Selecciona CSV intradía", intra_files, key='sel_intra')
+        # uploaded_intra=os.path.join('historicos',sel_i)
+    # else:
+        # st.sidebar.warning("No hay CSV intradía en 'historicos'.")
 # CSV diario
 use_csv_daily=st.sidebar.checkbox("Usar CSV diario (1d)")
 uploaded_daily=None
@@ -481,22 +481,23 @@ if not st.session_state.run:
     st.stop()
 # Validación símbolos
 symbol_intra=ticker_input
-if use_csv_intra:
-    sym_i,interval_i=parse_csv_filename(uploaded_intra)
-    if interval_i.lower()!='15m': st.error(f"CSV intradía inválido: {interval_i}"); st.stop()
-    symbol_intra=sym_i
+# if use_csv_intra:
+    # sym_i,interval_i=parse_csv_filename(uploaded_intra)
+    # if interval_i.lower()!='15m': st.error(f"CSV intradía inválido: {interval_i}"); st.stop()
+    # symbol_intra=sym_i
 symbol_daily=ticker_input
 if use_csv_daily:
     sym_d,interval_d=parse_csv_filename(uploaded_daily)
     if interval_d.lower() not in ('1d','daily'): st.error(f"CSV diario inválido: {interval_d}"); st.stop()
     symbol_daily=sym_d
-if use_csv_intra and not use_csv_daily and ticker_input!=symbol_intra:
-    st.error(f"Ticker ≠ CSV intradía: {ticker_input} vs {symbol_intra}"); st.stop()
-if use_csv_daily and not use_csv_intra and ticker_input!=symbol_daily:
-    st.error(f"Ticker ≠ CSV diario: {ticker_input} vs {symbol_daily}"); st.stop()
-if use_csv_intra and use_csv_daily and symbol_intra!=symbol_daily:
-    st.error("Símbolos intradía y diario difieren."); st.stop()
-asset_symbol=symbol_intra if use_csv_intra else symbol_daily
+# if use_csv_intra and not use_csv_daily and ticker_input!=symbol_intra:
+    # st.error(f"Ticker ≠ CSV intradía: {ticker_input} vs {symbol_intra}"); st.stop()
+# if use_csv_daily and not use_csv_intra and ticker_input!=symbol_daily:
+    # st.error(f"Ticker ≠ CSV diario: {ticker_input} vs {symbol_daily}"); st.stop()
+# if use_csv_intra and use_csv_daily and symbol_intra!=symbol_daily:
+    # st.error("Símbolos intradía y diario difieren."); st.stop()
+# asset_symbol=symbol_intra if use_csv_intra else symbol_daily
+asset_symbol=symbol_daily
 st.subheader(f"Activo: {asset_symbol}")
 # Fechas
 start=st.sidebar.date_input("Fecha inicio",datetime(2010,1,1))
@@ -506,11 +507,11 @@ if use_csv_daily:
     daily_df=load_csv_df(uploaded_daily,dayfirst=True)
 else:
     daily_df=fetch_data(asset_symbol,'1d',datetime.combine(start,datetime.min.time()),datetime.combine(end,datetime.min.time()))
-# Carga intradía
-if use_csv_intra:
-    intra_df=load_csv_df(uploaded_intra)
-else:
-    intra_df=fetch_data(asset_symbol,yahoo_interval,datetime.combine(start,datetime.min.time()),datetime.combine(end,datetime.min.time()))
+# # Carga intradía
+# if use_csv_intra:
+    # intra_df=load_csv_df(uploaded_intra)
+# else:
+    # intra_df=fetch_data(asset_symbol,yahoo_interval,datetime.combine(start,datetime.min.time()),datetime.combine(end,datetime.min.time()))
 # Mostrar brutos opcional
 if st.sidebar.checkbox("Mostrar datos brutos intradía"):
     st.subheader("Datos intradía brutos")
@@ -530,10 +531,13 @@ for m in d_modules:
 
 # Exportar último dataset
 
+# df_export = None
+# if any(str(m).startswith(tuple(['2','3','5','8','9','10'])) for m in d_modules):
+    # df_export = intra_df
+# elif any(str(m).startswith(tuple(['1','4','6','7'])) for m in d_modules):
+    # df_export = daily_df
 df_export = None
-if any(str(m).startswith(tuple(['2','3','5','8','9','10'])) for m in d_modules):
-    df_export = intra_df
-elif any(str(m).startswith(tuple(['1','4','6','7'])) for m in d_modules):
+if any(str(m).startswith(tuple(['1','4','6','7', '8'])) for m in d_modules):
     df_export = daily_df
 
 if df_export is not None:
